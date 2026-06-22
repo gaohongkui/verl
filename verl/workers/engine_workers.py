@@ -703,28 +703,39 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             return
 
         set_expandable_segments(False)
-        log_gpu_memory_usage("Before resume weights", logger=logger)
+        log_gpu_memory_usage("Before get_per_tensor_param", logger=logger)
 
-        # 1. resume rollout memory (weights were released during sleep)
+        # 1. Run actor-side weight-sync preparation before waking rollout weights.
+        # The returned iterator may materialize tensors lazily during transfer,
+        # but this call also performs actor-side load/state-dict setup and offload,
+        # so clear trainer-side cache before vLLM restores rollout weights.
+        per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
+            layered_summon=self.layered_summon, base_sync_done=True
+        )
+        aggressive_empty_cache(force_sync=True)
+        log_gpu_memory_usage("After get_per_tensor_param", logger=logger)
+
+        do_lora_base_sync = False
+        per_tensor_param_base = None
+        if not self.peft_merge and peft_config is not None:
+            self.rollout.sleep_level = 1
+            do_lora_base_sync = not self.base_sync_done
+            if do_lora_base_sync:
+                log_gpu_memory_usage("Before get_per_tensor_param base", logger=logger)
+                per_tensor_param_base, peft_config = self.actor.engine.get_per_tensor_param(
+                    layered_summon=self.layered_summon, base_sync_done=False
+                )
+                aggressive_empty_cache(force_sync=True)
+                log_gpu_memory_usage("After get_per_tensor_param base", logger=logger)
+
+        # 2. resume rollout memory (weights were released during sleep)
+        log_gpu_memory_usage("Before resume weights", logger=logger)
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
         log_gpu_memory_usage("After resume weights", logger=logger)
 
-        # 2. determine if we need a base weight sync (adapter path only)
-        per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
-            layered_summon=self.layered_summon, base_sync_done=True
-        )
-
-        do_lora_base_sync = False
-        if not self.peft_merge and peft_config is not None:
-            self.rollout.sleep_level = 1
-            do_lora_base_sync = not self.base_sync_done
-
         # 3. sync weights: For SGLang, we need base first (when needed), then adapter/merged
         if do_lora_base_sync:
-            per_tensor_param_base, peft_config = self.actor.engine.get_per_tensor_param(
-                layered_summon=self.layered_summon, base_sync_done=False
-            )
             await self.rollout.update_weights(
                 per_tensor_param_base, peft_config=peft_config, base_sync_done=False, global_steps=global_steps
             )
